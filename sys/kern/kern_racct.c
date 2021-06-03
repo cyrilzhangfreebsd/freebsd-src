@@ -104,6 +104,8 @@ static void racct_sub_cred_locked(struct ucred *cred, int resource,
 static void racct_add_cred_locked(struct ucred *cred, int resource,
 		uint64_t amount);
 
+static uint64_t racct_estimate_pcpu(uint64_t runtime, struct timeval *wallclock);
+
 SDT_PROVIDER_DEFINE(racct);
 SDT_PROBE_DEFINE3(racct, , rusage, add,
     "struct proc *", "int", "uint64_t");
@@ -314,6 +316,17 @@ fixpt_t ccpu_exp[] = {
 #endif
 
 #define	CCPU_EXP_MAX	110
+
+static uint64_t
+racct_estimate_pcpu(uint64_t runtime, struct timeval *wallclock)
+{
+	if (wallclock->tv_sec > 0 || wallclock->tv_usec > 0) {
+		return ((runtime * 100) /
+		    ((uint64_t)wallclock->tv_sec * 1000000 +
+		    wallclock->tv_usec));
+	} else
+		return (0);
+}
 
 /*
  * This function is analogical to the getpcpu() function in the ps(1) command.
@@ -1012,12 +1025,7 @@ racct_proc_exit(struct proc *p)
 #endif
 	microuptime(&wallclock);
 	timevalsub(&wallclock, &p->p_stats->p_start);
-	if (wallclock.tv_sec > 0 || wallclock.tv_usec > 0) {
-		pct_estimate = (1000000 * runtime * 100) /
-		    ((uint64_t)wallclock.tv_sec * 1000000 +
-		    wallclock.tv_usec);
-	} else
-		pct_estimate = 0;
+	pct_estimate = racct_estimate_pcpu(runtime, &wallclock);
 	pct = racct_getpcpu(p, pct_estimate);
 
 	RACCT_LOCK();
@@ -1282,12 +1290,7 @@ racctd(void)
 				runtime = p->p_prev_runtime;
 #endif
 			p->p_prev_runtime = runtime;
-			if (wallclock.tv_sec > 0 || wallclock.tv_usec > 0) {
-				pct_estimate = (1000000 * runtime * 100) /
-				    ((uint64_t)wallclock.tv_sec * 1000000 +
-				    wallclock.tv_usec);
-			} else
-				pct_estimate = 0;
+			pct_estimate = racct_estimate_pcpu(runtime, &wallclock);
 			pct = racct_getpcpu(p, pct_estimate);
 			RACCT_LOCK();
 #ifdef RCTL
