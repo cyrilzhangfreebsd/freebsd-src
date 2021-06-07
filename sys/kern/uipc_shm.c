@@ -73,6 +73,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/mutex.h>
 #include <sys/priv.h>
 #include <sys/proc.h>
+#include <sys/racct.h>
 #include <sys/refcount.h>
 #include <sys/resourcevar.h>
 #include <sys/rwlock.h>
@@ -851,23 +852,34 @@ shm_dotruncate(struct shmfd *shmfd, off_t length)
  * routines.
  */
 struct shmfd *
-shm_alloc(struct ucred *ucred, mode_t mode, bool largepage)
+shm_alloc(struct thread *td, mode_t mode, bool largepage)
 {
 	struct shmfd *shmfd;
 
+#ifdef RACCT
+	if (racct_enable) {
+		PROC_LOCK(td->td_proc);
+		if (racct_add(td->td_proc, RACCT_NSHM, 1)) {
+			PROC_UNLOCK(td->td_proc);
+			return (NULL);
+		}
+		PROC_UNLOCK(td->td_proc);
+	}
+#endif
+
 	shmfd = malloc(sizeof(*shmfd), M_SHMFD, M_WAITOK | M_ZERO);
 	shmfd->shm_size = 0;
-	shmfd->shm_uid = ucred->cr_uid;
-	shmfd->shm_gid = ucred->cr_gid;
+	shmfd->shm_uid = td->td_ucred->cr_uid;
+	shmfd->shm_gid = td->td_ucred->cr_gid;
 	shmfd->shm_mode = mode;
 	if (largepage) {
 		shmfd->shm_object = phys_pager_allocate(NULL,
 		    &shm_largepage_phys_ops, NULL, shmfd->shm_size,
-		    VM_PROT_DEFAULT, 0, ucred);
+		    VM_PROT_DEFAULT, 0, td->td_ucred);
 		shmfd->shm_lp_alloc_policy = SHM_LARGEPAGE_ALLOC_DEFAULT;
 	} else {
 		shmfd->shm_object = vm_pager_allocate(OBJT_SWAP, NULL,
-		    shmfd->shm_size, VM_PROT_DEFAULT, 0, ucred);
+		    shmfd->shm_size, VM_PROT_DEFAULT, 0, td->td_ucred);
 	}
 	KASSERT(shmfd->shm_object != NULL, ("shm_create: vm_pager_allocate"));
 	vfs_timestamp(&shmfd->shm_birthtime);
@@ -879,7 +891,7 @@ shm_alloc(struct ucred *ucred, mode_t mode, bool largepage)
 	rangelock_init(&shmfd->shm_rl);
 #ifdef MAC
 	mac_posixshm_init(shmfd);
-	mac_posixshm_create(ucred, shmfd);
+	mac_posixshm_create(td->td_ucred, shmfd);
 #endif
 
 	return (shmfd);
@@ -900,6 +912,11 @@ shm_drop(struct shmfd *shmfd)
 	if (refcount_release(&shmfd->shm_refs)) {
 #ifdef MAC
 		mac_posixshm_destroy(shmfd);
+#endif
+#ifdef RACCT
+		if (racct_enable) {
+			racct_sub_cred(shmfd->shm_object->cred, RACCT_NSHM, 1);
+		}
 #endif
 		rangelock_destroy(&shmfd->shm_rl);
 		mtx_destroy(&shmfd->shm_mtx);
@@ -1103,7 +1120,10 @@ kern_shm_open2(struct thread *td, const char *userpath, int flags, mode_t mode,
 			fdrop(fp, td);
 			return (EINVAL);
 		}
-		shmfd = shm_alloc(td->td_ucred, cmode, largepage);
+		shmfd = shm_alloc(td, cmode, largepage);
+		if (shmfd == NULL) {
+			return (ENOSPC);
+		}
 		shmfd->shm_seals = initial_seals;
 		shmfd->shm_flags = shmflags;
 	} else {
@@ -1126,8 +1146,11 @@ kern_shm_open2(struct thread *td, const char *userpath, int flags, mode_t mode,
 				    path);
 				if (error == 0) {
 #endif
-					shmfd = shm_alloc(td->td_ucred, cmode,
-					    largepage);
+					shmfd = shm_alloc(td, cmode, largepage);
+					if (shmfd == NULL) {
+						sx_xunlock(&shm_dict_lock);
+						return (ENOSPC);
+					}
 					shmfd->shm_seals = initial_seals;
 					shmfd->shm_flags = shmflags;
 					shm_insert(path, fnv, shmfd);
