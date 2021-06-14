@@ -88,6 +88,7 @@ struct ucred;
 #define	RACCT_DENIABLE		0x08
 #define	RACCT_SLOPPY		0x10
 #define	RACCT_DECAYING		0x20
+#define	RACCT_PERSISTENT	0x40
 
 extern int racct_types[];
 extern bool racct_enable;
@@ -138,9 +139,17 @@ extern bool racct_enable;
 #define RACCT_IS_DECAYING(X)		(racct_types[X] & RACCT_DECAYING)
 
 /*
+ * Resource usage can drop, but its resource usage is not automatically
+ * subtracted from per-credential racct containers when a process terminates.
+ * Instead, the resource usage of per-credential racct containers must be
+ * manually dropped by another process.
+ */
+#define RACCT_IS_PERSISTENT(X)		(racct_types[X] & RACCT_PERSISTENT)
+
+/*
  * Resource usage can drop, as opposed to only grow.
  */
-#define RACCT_CAN_DROP(X)		(RACCT_IS_RECLAIMABLE(X) | RACCT_IS_DECAYING(X))
+#define RACCT_CAN_DROP(X)		(RACCT_IS_RECLAIMABLE(X) | RACCT_IS_DECAYING(X) | RACCT_IS_PERSISTENT(X))
 
 /*
  * The 'racct' structure defines resource consumption for a particular
