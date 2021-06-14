@@ -126,10 +126,10 @@ static void	shm_init(void *arg);
 static void	shm_insert(char *path, Fnv32_t fnv, struct shmfd *shmfd);
 static struct shmfd *shm_lookup(char *path, Fnv32_t fnv);
 static int	shm_remove(char *path, Fnv32_t fnv, struct ucred *ucred);
-static int	shm_dotruncate_cookie(struct shmfd *shmfd, off_t length,
-    void *rl_cookie);
-static int	shm_dotruncate_locked(struct shmfd *shmfd, off_t length,
-    void *rl_cookie);
+static int	shm_dotruncate_cookie(struct thread *td, struct shmfd *shmfd,
+    off_t length, void *rl_cookie);
+static int	shm_dotruncate_locked(struct thread *td, struct shmfd *shmfd,
+    off_t length, void *rl_cookie);
 static int	shm_copyin_path(struct thread *td, const char *userpath_in,
     char **path_out);
 
@@ -451,7 +451,7 @@ shm_write(struct file *fp, struct uio *uio, struct ucred *active_cred,
 		error = 0;
 		if ((shmfd->shm_flags & SHM_GROW_ON_WRITE) != 0 &&
 		    size > shmfd->shm_size) {
-			error = shm_dotruncate_cookie(shmfd, size, rl_cookie);
+			error = shm_dotruncate_cookie(td, shmfd, size, rl_cookie);
 		}
 		if (error == 0)
 			error = uiomove_object(shmfd->shm_object,
@@ -477,7 +477,7 @@ shm_truncate(struct file *fp, off_t length, struct ucred *active_cred,
 	if (error)
 		return (error);
 #endif
-	return (shm_dotruncate(shmfd, length));
+	return (shm_dotruncate(td, shmfd, length));
 }
 
 int
@@ -628,7 +628,7 @@ out:
 }
 
 static int
-shm_dotruncate_locked(struct shmfd *shmfd, off_t length, void *rl_cookie)
+shm_dotruncate_locked(struct thread *td, struct shmfd *shmfd, off_t length, void *rl_cookie)
 {
 	vm_object_t object;
 	vm_page_t m;
@@ -710,14 +710,39 @@ retry:
 		/* Free the swap accounted for shm */
 		swap_release_by_cred(delta, object->cred);
 		object->charge -= delta;
+#ifdef RACCT
+		if (racct_enable) {
+			racct_sub_cred(object->cred, RACCT_SHMSIZE,
+			    shmfd->shm_size - length);
+		}
+#endif
 	} else {
 		if ((shmfd->shm_seals & F_SEAL_GROW) != 0)
 			return (EPERM);
 
+#ifdef RACCT
+		if (racct_enable) {
+			PROC_LOCK(td->td_proc);
+			if (racct_add_cred_checked(object->cred, RACCT_SHMSIZE,
+			    length - shmfd->shm_size)) {
+				PROC_UNLOCK(td->td_proc);
+				return (ENOMEM);
+			}
+			PROC_UNLOCK(td->td_proc);
+		}
+#endif
+
 		/* Try to reserve additional swap space. */
 		delta = IDX_TO_OFF(nobjsize - object->size);
-		if (!swap_reserve_by_cred(delta, object->cred))
+		if (!swap_reserve_by_cred(delta, object->cred)) {
+#ifdef RACCT
+			if (racct_enable) {
+				racct_sub_cred(object->cred, RACCT_SHMSIZE,
+				    length - shmfd->shm_size);
+			}
+#endif
 			return (ENOMEM);
+		}
 		object->charge += delta;
 	}
 	shmfd->shm_size = length;
@@ -730,7 +755,7 @@ retry:
 }
 
 static int
-shm_dotruncate_largepage(struct shmfd *shmfd, off_t length, void *rl_cookie)
+shm_dotruncate_largepage(struct thread *td, struct shmfd *shmfd, off_t length, void *rl_cookie)
 {
 	vm_object_t object;
 	vm_page_t m;
@@ -769,6 +794,17 @@ shm_dotruncate_largepage(struct shmfd *shmfd, off_t length, void *rl_cookie)
 	if ((shmfd->shm_seals & F_SEAL_GROW) != 0)
 		return (EPERM);
 
+#ifdef RACCT
+	if (racct_enable) {
+		PROC_LOCK(td->td_proc);
+		if (racct_add(td->td_proc, RACCT_SHMSIZE, length - shmfd->shm_size)) {
+			PROC_UNLOCK(td->td_proc);
+			return (ENOMEM);
+		}
+		PROC_UNLOCK(td->td_proc);
+	}
+#endif
+
 	aflags = VM_ALLOC_NORMAL | VM_ALLOC_ZERO;
 	if (shmfd->shm_lp_alloc_policy == SHM_LARGEPAGE_ALLOC_NOWAIT)
 		aflags |= VM_ALLOC_WAITFAIL;
@@ -791,6 +827,12 @@ shm_dotruncate_largepage(struct shmfd *shmfd, off_t length, void *rl_cookie)
 			    (shmfd->shm_lp_alloc_policy ==
 			    SHM_LARGEPAGE_ALLOC_DEFAULT &&
 			    try >= largepage_reclaim_tries)) {
+#ifdef RACCT
+				if (racct_enable) {
+					racct_sub_cred(object->cred, RACCT_SHMSIZE,
+					    length - shmfd->shm_size);
+				}
+#endif
 				VM_OBJECT_WLOCK(object);
 				return (ENOMEM);
 			}
@@ -800,6 +842,12 @@ shm_dotruncate_largepage(struct shmfd *shmfd, off_t length, void *rl_cookie)
 			    vm_wait_intr(object);
 			if (error != 0) {
 				VM_OBJECT_WLOCK(object);
+#ifdef RACCT
+				if (racct_enable) {
+					racct_sub_cred(object->cred, RACCT_SHMSIZE,
+					    length - shmfd->shm_size);
+				}
+#endif
 				return (error);
 			}
 			try++;
@@ -822,27 +870,27 @@ shm_dotruncate_largepage(struct shmfd *shmfd, off_t length, void *rl_cookie)
 }
 
 static int
-shm_dotruncate_cookie(struct shmfd *shmfd, off_t length, void *rl_cookie)
+shm_dotruncate_cookie(struct thread *td, struct shmfd *shmfd, off_t length, void *rl_cookie)
 {
 	int error;
 
 	VM_OBJECT_WLOCK(shmfd->shm_object);
-	error = shm_largepage(shmfd) ? shm_dotruncate_largepage(shmfd,
-	    length, rl_cookie) : shm_dotruncate_locked(shmfd, length,
+	error = shm_largepage(shmfd) ? shm_dotruncate_largepage(td, shmfd,
+	    length, rl_cookie) : shm_dotruncate_locked(td, shmfd, length,
 	    rl_cookie);
 	VM_OBJECT_WUNLOCK(shmfd->shm_object);
 	return (error);
 }
 
 int
-shm_dotruncate(struct shmfd *shmfd, off_t length)
+shm_dotruncate(struct thread *td, struct shmfd *shmfd, off_t length)
 {
 	void *rl_cookie;
 	int error;
 
 	rl_cookie = rangelock_wlock(&shmfd->shm_rl, 0, OFF_MAX,
 	    &shmfd->shm_mtx);
-	error = shm_dotruncate_cookie(shmfd, length, rl_cookie);
+	error = shm_dotruncate_cookie(td, shmfd, length, rl_cookie);
 	rangelock_unlock(&shmfd->shm_rl, rl_cookie, &shmfd->shm_mtx);
 	return (error);
 }
@@ -916,6 +964,8 @@ shm_drop(struct shmfd *shmfd)
 #ifdef RACCT
 		if (racct_enable) {
 			racct_sub_cred(shmfd->shm_object->cred, RACCT_NSHM, 1);
+			racct_sub_cred(shmfd->shm_object->cred, RACCT_SHMSIZE,
+			    shmfd->shm_size);
 		}
 #endif
 		rangelock_destroy(&shmfd->shm_rl);
@@ -1222,8 +1272,8 @@ kern_shm_open2(struct thread *td, const char *userpath, int flags, mode_t mode,
 					td->td_ucred, fp->f_cred, shmfd);
 				if (error == 0)
 #endif
-					error = shm_dotruncate_locked(shmfd, 0,
-					    rl_cookie);
+					error = shm_dotruncate_locked(td, shmfd,
+					    0, rl_cookie);
 				VM_OBJECT_WUNLOCK(shmfd->shm_object);
 			}
 			if (error == 0) {
@@ -1922,7 +1972,7 @@ shm_fallocate(struct file *fp, off_t offset, off_t len, struct thread *td)
 	rl_cookie = rangelock_wlock(&shmfd->shm_rl, offset, size,
 	    &shmfd->shm_mtx);
 	if (size > shmfd->shm_size)
-		error = shm_dotruncate_cookie(shmfd, size, rl_cookie);
+		error = shm_dotruncate_cookie(td, shmfd, size, rl_cookie);
 	rangelock_unlock(&shmfd->shm_rl, rl_cookie, &shmfd->shm_mtx);
 	/* Translate to posix_fallocate(2) return value as needed. */
 	if (error == ENOMEM)

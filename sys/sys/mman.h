@@ -307,7 +307,7 @@ int	shm_access(struct shmfd *shmfd, struct ucred *ucred, int flags);
 struct shmfd *shm_alloc(struct thread *td, mode_t mode, bool largepage);
 struct shmfd *shm_hold(struct shmfd *shmfd);
 void	shm_drop(struct shmfd *shmfd);
-int	shm_dotruncate(struct shmfd *shmfd, off_t length);
+int	shm_dotruncate(struct thread *td, struct shmfd *shmfd, off_t length);
 bool	shm_largepage(struct shmfd *shmfd);
 
 extern struct fileops shm_ops;

@@ -4016,7 +4016,7 @@ umtx_shm_create_reg(struct thread *td, const struct umtx_key *key,
 	bcopy(key, &reg->ushm_key, sizeof(*key));
 	reg->ushm_obj = shm_alloc(td, O_RDWR, false);
 	reg->ushm_cred = crhold(cred);
-	error = shm_dotruncate(reg->ushm_obj, PAGE_SIZE);
+	error = shm_dotruncate(td, reg->ushm_obj, PAGE_SIZE);
 	if (error != 0) {
 		umtx_shm_free_reg(reg);
 		return (error);
