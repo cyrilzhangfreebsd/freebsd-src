@@ -176,6 +176,8 @@ extern struct mtx racct_lock;
 
 int	racct_add(struct proc *p, int resource, uint64_t amount);
 void	racct_add_cred(struct ucred *cred, int resource, uint64_t amount);
+int	racct_add_cred_checked(struct ucred *cred, int resource,
+	    uint64_t amount);
 void	racct_add_force(struct proc *p, int resource, uint64_t amount);
 void	racct_add_buf(struct proc *p, const struct buf *bufp, int is_write);
 int	racct_set(struct proc *p, int resource, uint64_t amount);

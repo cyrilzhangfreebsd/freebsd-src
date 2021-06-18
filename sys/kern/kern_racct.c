@@ -113,6 +113,10 @@ SDT_PROBE_DEFINE3(racct, , rusage, add__buf,
     "struct proc *", "const struct buf *", "int");
 SDT_PROBE_DEFINE3(racct, , rusage, add__cred,
     "struct ucred *", "int", "uint64_t");
+SDT_PROBE_DEFINE3(racct, , rusage, add__cred__checked,
+    "struct ucred *", "int", "uint64_t");
+SDT_PROBE_DEFINE3(racct, , rusage, add__cred__checked__failure,
+    "struct ucred *", "int", "uint64_t");
 SDT_PROBE_DEFINE3(racct, , rusage, add__force,
     "struct proc *", "int", "uint64_t");
 SDT_PROBE_DEFINE3(racct, , rusage, set,
@@ -628,7 +632,6 @@ racct_add_cred_locked(struct ucred *cred, int resource, uint64_t amount)
 void
 racct_add_cred(struct ucred *cred, int resource, uint64_t amount)
 {
-
 	if (!racct_enable)
 		return;
 
@@ -637,6 +640,46 @@ racct_add_cred(struct ucred *cred, int resource, uint64_t amount)
 	RACCT_LOCK();
 	racct_add_cred_locked(cred, resource, amount);
 	RACCT_UNLOCK();
+}
+
+static int
+racct_add_cred_checked_locked(struct ucred *cred, int resource, uint64_t amount)
+{
+#ifdef RCTL
+	int error;
+#endif
+
+	ASSERT_RACCT_ENABLED();
+
+#ifdef RCTL
+	error = rctl_enforce_cred(cred, resource, amount);
+	if (error && RACCT_IS_DENIABLE(resource)) {
+		SDT_PROBE3(racct, , rusage, add__cred__checked__failure, cred,
+		    resource, amount);
+		return (error);
+	}
+#endif
+	racct_add_cred_locked(cred, resource, amount);
+
+	return (0);
+}
+
+/*
+ * Increase allocation of 'resource' by 'amount' for credential 'cred'.
+ * Return 0 if it's below limits, or errno, if it's not.
+ */
+int
+racct_add_cred_checked(struct ucred *cred, int resource, uint64_t amount)
+{
+	int error;
+	if (!racct_enable)
+		return (0);
+
+	SDT_PROBE3(racct, , rusage, add__cred__checked, cred, resource, amount);
+	RACCT_LOCK();
+	error = racct_add_cred_checked_locked(cred, resource, amount);
+	RACCT_UNLOCK();
+	return (error);
 }
 
 /*

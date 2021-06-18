@@ -221,6 +221,8 @@ static uma_zone_t rctl_rule_link_zone;
 
 static int rctl_rule_fully_specified(const struct rctl_rule *rule);
 static void rctl_rule_to_sbuf(struct sbuf *sb, const struct rctl_rule *rule);
+static int rctl_enforce_racct(struct racct *racct, int resource, uint64_t amount,
+    struct ucred *cred);
 
 static MALLOC_DEFINE(M_RCTL, "rctl", "Resource Limits");
 
@@ -332,6 +334,25 @@ rctl_resource_name(int resource)
 }
 
 static struct racct *
+rctl_proc_rule_to_racct_cred(const struct ucred *cred,
+    const struct rctl_rule *rule)
+{
+	KASSERT(rule->rr_per != RCTL_SUBJECT_TYPE_PROCESS,
+	    ("rctl_proc_rule_to_racct_cred: cannot get process racct"));
+
+	switch (rule->rr_per) {
+	case RCTL_SUBJECT_TYPE_USER:
+		return (cred->cr_ruidinfo->ui_racct);
+	case RCTL_SUBJECT_TYPE_LOGINCLASS:
+		return (cred->cr_loginclass->lc_racct);
+	case RCTL_SUBJECT_TYPE_JAIL:
+		return (cred->cr_prison->pr_prison_racct->prr_racct);
+	default:
+		panic("%s: unknown per %d", __func__, rule->rr_per);
+	}
+}
+
+static struct racct *
 rctl_proc_rule_to_racct(const struct proc *p, const struct rctl_rule *rule)
 {
 	struct ucred *cred = p->p_ucred;
@@ -342,14 +363,8 @@ rctl_proc_rule_to_racct(const struct proc *p, const struct rctl_rule *rule)
 	switch (rule->rr_per) {
 	case RCTL_SUBJECT_TYPE_PROCESS:
 		return (p->p_racct);
-	case RCTL_SUBJECT_TYPE_USER:
-		return (cred->cr_ruidinfo->ui_racct);
-	case RCTL_SUBJECT_TYPE_LOGINCLASS:
-		return (cred->cr_loginclass->lc_racct);
-	case RCTL_SUBJECT_TYPE_JAIL:
-		return (cred->cr_prison->pr_prison_racct->prr_racct);
 	default:
-		panic("%s: unknown per %d", __func__, rule->rr_per);
+		return (rctl_proc_rule_to_racct_cred(cred, rule));
 	}
 }
 
@@ -367,6 +382,26 @@ rctl_available_resource(const struct proc *p, const struct rctl_rule *rule)
 	RACCT_LOCK_ASSERT();
 
 	racct = rctl_proc_rule_to_racct(p, rule);
+	available = rule->rr_amount - racct->r_resources[rule->rr_resource];
+
+	return (available);
+}
+
+/*
+ * Return the amount of resource that can be allocated by 'cred' before
+ * hitting 'rule'.
+ */
+static int64_t
+rctl_available_resource_cred(const struct ucred *cred,
+    const struct rctl_rule *rule)
+{
+	const struct racct *racct;
+	int64_t available;
+
+	ASSERT_RACCT_ENABLED();
+	RACCT_LOCK_ASSERT();
+
+	racct = rctl_proc_rule_to_racct_cred(cred, rule);
 	available = rule->rr_amount - racct->r_resources[rule->rr_resource];
 
 	return (available);
@@ -490,6 +525,258 @@ xmul(uint64_t a, uint64_t b)
 }
 
 /*
+ * Check whether the credential 'cred' can allocate 'amount' of 'resource' in
+ * addition to what it keeps allocated now.  Returns non-zero if the allocation
+ * should be denied, 0 otherwise.  Does not enforce rules whose actions require
+ * a process, i.e., throttle and sig*.
+ */
+int
+rctl_enforce_cred(struct ucred *cred, int resource, uint64_t amount)
+{
+	int error = 0;
+	error |= rctl_enforce_racct(cred->cr_ruidinfo->ui_racct,
+	    resource, amount, cred);
+	error |= rctl_enforce_racct(cred->cr_loginclass->lc_racct,
+	    resource, amount, cred);
+	error |= rctl_enforce_racct(cred->cr_prison->pr_prison_racct->prr_racct,
+	    resource, amount, cred);
+	return (error);
+}
+
+static void
+rctl_log_handler(struct rctl_rule *rule, struct proc *p, struct ucred *cred)
+{
+	static struct timeval log_lasttime;
+	static int log_curtime = 0;
+	struct sbuf sb;
+	char *buf;
+
+	if (!ppsratecheck(&log_lasttime, &log_curtime,
+	    rctl_log_rate_limit))
+		return;
+
+	if (p) {
+		cred = p->p_ucred;
+	}
+	buf = malloc(RCTL_LOG_BUFSIZE, M_RCTL, M_NOWAIT);
+	if (buf == NULL) {
+		printf("rctl_enforce_racct: out of memory\n");
+		return;
+	}
+	sbuf_new(&sb, buf, RCTL_LOG_BUFSIZE, SBUF_FIXEDLEN);
+	rctl_rule_to_sbuf(&sb, rule);
+	sbuf_finish(&sb);
+	if (p) {
+		printf("rctl: rule \"%s\" matched by pid %d "
+		    "(%s), uid %d, jail %s\n", sbuf_data(&sb),
+		    p->p_pid, p->p_comm, p->p_ucred->cr_uid,
+		    p->p_ucred->cr_prison->pr_prison_racct->prr_name);
+	}
+	else {
+		printf("rctl: rule \"%s\" matched by uid %d, jail %s\n",
+		    sbuf_data(&sb), cred->cr_uid,
+		    cred->cr_prison->pr_prison_racct->prr_name);
+	}
+	sbuf_delete(&sb);
+	free(buf, M_RCTL);
+}
+
+static void
+rctl_devctl_handler(struct rctl_rule *rule, struct proc *p, struct ucred *cred)
+{
+	static struct timeval devctl_lasttime;
+	static int devctl_curtime = 0;
+	struct sbuf sb;
+	char *buf;
+
+	if (!ppsratecheck(&devctl_lasttime, &devctl_curtime,
+	    rctl_devctl_rate_limit))
+		return;
+
+	if (p) {
+		cred = p->p_ucred;
+	}
+	buf = malloc(RCTL_LOG_BUFSIZE, M_RCTL, M_NOWAIT);
+	if (buf == NULL) {
+		printf("rctl_enforce_racct: out of memory\n");
+		return;
+	}
+	sbuf_new(&sb, buf, RCTL_LOG_BUFSIZE, SBUF_FIXEDLEN);
+	sbuf_printf(&sb, "rule=");
+	rctl_rule_to_sbuf(&sb, rule);
+	if (p) {
+		sbuf_printf(&sb, " pid=%d ruid=%d jail=%s",
+		    p->p_pid, p->p_ucred->cr_ruid,
+		    p->p_ucred->cr_prison->pr_prison_racct->prr_name);
+	}
+	else {
+		sbuf_printf(&sb, " ruid=%d jail=%s", cred->cr_ruid,
+		    cred->cr_prison->pr_prison_racct->prr_name);
+	}
+	sbuf_finish(&sb);
+	devctl_notify("RCTL", "rule", "matched",
+	    sbuf_data(&sb));
+	sbuf_delete(&sb);
+	free(buf, M_RCTL);
+}
+
+static void
+rctl_throttle_handler(struct rctl_rule *rule, int resource, struct proc * p)
+{
+	uint64_t sleep_ms, sleep_ratio;
+	int64_t available;
+
+	if (rule->rr_amount == 0) {
+		racct_proc_throttle(p, rctl_throttle_max);
+		return;
+	}
+
+	/*
+	 * Make the process sleep for a fraction of second
+	 * proportional to the ratio of process' resource
+	 * utilization compared to the limit.  The point is
+	 * to penalize resource hogs: processes that consume
+	 * more of the available resources sleep for longer.
+	 *
+	 * We're trying to defer division until the very end,
+	 * to minimize the rounding effects.  The following
+	 * calculation could have been written in a clearer
+	 * way like this:
+	 *
+	 * sleep_ms = hz * p->p_racct->r_resources[resource] /
+	 *     rule->rr_amount;
+	 * sleep_ms *= rctl_throttle_pct / 100;
+	 * if (sleep_ms < rctl_throttle_min)
+	 *         sleep_ms = rctl_throttle_min;
+	 *
+	 */
+	sleep_ms = xmul(hz, p->p_racct->r_resources[resource]);
+	sleep_ms = xmul(sleep_ms,  rctl_throttle_pct) / 100;
+	if (sleep_ms < rctl_throttle_min * rule->rr_amount)
+		sleep_ms = rctl_throttle_min * rule->rr_amount;
+
+	/*
+	 * Multiply that by the ratio of the resource
+	 * consumption for the container compared to the limit,
+	 * squared.  In other words, a process in a container
+	 * that is two times over the limit will be throttled
+	 * four times as much for hitting the same rule.  The
+	 * point is to penalize processes more if the container
+	 * itself (eg certain UID or jail) is above the limit.
+	 */
+	available = rctl_available_resource(p, rule);
+	if (available < 0)
+		sleep_ratio = -available / rule->rr_amount;
+	else
+		sleep_ratio = 0;
+	sleep_ratio = xmul(sleep_ratio, sleep_ratio);
+	sleep_ratio = xmul(sleep_ratio, rctl_throttle_pct2) / 100;
+	sleep_ms = xadd(sleep_ms, xmul(sleep_ms, sleep_ratio));
+
+	/*
+	 * Finally the division.
+	 */
+	sleep_ms /= rule->rr_amount;
+
+	if (sleep_ms > rctl_throttle_max)
+		sleep_ms = rctl_throttle_max;
+#if 0
+	printf("%s: pid %d (%s), %jd of %jd, will sleep for %ju ms (ratio %ju, available %jd)\n",
+	   __func__, p->p_pid, p->p_comm,
+	   p->p_racct->r_resources[resource],
+	   rule->rr_amount, (uintmax_t)sleep_ms,
+	   (uintmax_t)sleep_ratio, (intmax_t)available);
+#endif
+
+	KASSERT(sleep_ms >= rctl_throttle_min, ("%s: %ju < %d\n",
+	    __func__, (uintmax_t)sleep_ms, rctl_throttle_min));
+	racct_proc_throttle(p, sleep_ms);
+}
+
+static void
+rctl_sig_handler(struct rctl_rule *rule, struct proc *p)
+{
+	KASSERT(rule->rr_action > 0 &&
+	    rule->rr_action <= RCTL_ACTION_SIGNAL_MAX,
+	    ("rctl_sig: unknown action %d",
+	     rule->rr_action));
+
+	/*
+	 * We're using the fact that RCTL_ACTION_SIG* values
+	 * are equal to their counterparts from sys/signal.h.
+	 */
+	kern_psignal(p, rule->rr_action);
+}
+
+static int
+rctl_enforce_racct(struct racct *racct, int resource, uint64_t amount, struct ucred *cred)
+{
+	struct rctl_rule *rule;
+	struct rctl_rule_link *link;
+	int64_t available;
+	int should_deny = 0;
+
+	ASSERT_RACCT_ENABLED();
+	RACCT_LOCK_ASSERT();
+
+	/*
+	 * There may be more than one matching rule; go through all of them.
+	 * Denial should be done last, after logging and sending signals.
+	 */
+	LIST_FOREACH(link, &racct->r_rule_links, rrl_next) {
+		rule = link->rrl_rule;
+		if (rule->rr_resource != resource)
+			continue;
+		if (rule->rr_per == RCTL_SUBJECT_TYPE_PROCESS)
+			continue;
+
+		available = rctl_available_resource_cred(cred, rule);
+		if (available >= (int64_t)amount) {
+			link->rrl_exceeded = 0;
+			continue;
+		}
+
+		switch (rule->rr_action) {
+		case RCTL_ACTION_DENY:
+			should_deny = 1;
+			continue;
+		case RCTL_ACTION_LOG:
+			/*
+			 * If rrl_exceeded != 0, it means we've already
+			 * logged a warning for this process.
+			 */
+			if (link->rrl_exceeded != 0)
+				continue;
+
+			rctl_log_handler(rule, NULL, cred);
+			link->rrl_exceeded = 1;
+			continue;
+		case RCTL_ACTION_DEVCTL:
+			if (link->rrl_exceeded != 0)
+				continue;
+
+			rctl_devctl_handler(rule, NULL, cred);
+			link->rrl_exceeded = 1;
+			continue;
+		case RCTL_ACTION_THROTTLE:
+			continue;
+		default:
+			continue;
+		}
+	}
+
+	if (should_deny) {
+		/*
+		 * Return fake error code; the caller should change it
+		 * into one proper for the situation - EFSIZ, ENOMEM etc.
+		 */
+		return (EDOOFUS);
+	}
+
+	return (0);
+}
+
+/*
  * Check whether the proc 'p' can allocate 'amount' of 'resource' in addition
  * to what it keeps allocated now.  Returns non-zero if the allocation should
  * be denied, 0 otherwise.
@@ -497,14 +784,9 @@ xmul(uint64_t a, uint64_t b)
 int
 rctl_enforce(struct proc *p, int resource, uint64_t amount)
 {
-	static struct timeval log_lasttime, devctl_lasttime;
-	static int log_curtime = 0, devctl_curtime = 0;
 	struct rctl_rule *rule;
 	struct rctl_rule_link *link;
-	struct sbuf sb;
-	char *buf;
 	int64_t available;
-	uint64_t sleep_ms, sleep_ratio;
 	int should_deny = 0;
 
 	ASSERT_RACCT_ENABLED();
@@ -547,24 +829,7 @@ rctl_enforce(struct proc *p, int resource, uint64_t amount)
 			if (p->p_state != PRS_NORMAL)
 				continue;
 
-			if (!ppsratecheck(&log_lasttime, &log_curtime,
-			    rctl_log_rate_limit))
-				continue;
-
-			buf = malloc(RCTL_LOG_BUFSIZE, M_RCTL, M_NOWAIT);
-			if (buf == NULL) {
-				printf("rctl_enforce: out of memory\n");
-				continue;
-			}
-			sbuf_new(&sb, buf, RCTL_LOG_BUFSIZE, SBUF_FIXEDLEN);
-			rctl_rule_to_sbuf(&sb, rule);
-			sbuf_finish(&sb);
-			printf("rctl: rule \"%s\" matched by pid %d "
-			    "(%s), uid %d, jail %s\n", sbuf_data(&sb),
-			    p->p_pid, p->p_comm, p->p_ucred->cr_uid,
-			    p->p_ucred->cr_prison->pr_prison_racct->prr_name);
-			sbuf_delete(&sb);
-			free(buf, M_RCTL);
+			rctl_log_handler(rule, p, NULL);
 			link->rrl_exceeded = 1;
 			continue;
 		case RCTL_ACTION_DEVCTL:
@@ -574,96 +839,14 @@ rctl_enforce(struct proc *p, int resource, uint64_t amount)
 			if (p->p_state != PRS_NORMAL)
 				continue;
 
-			if (!ppsratecheck(&devctl_lasttime, &devctl_curtime,
-			    rctl_devctl_rate_limit))
-				continue;
-
-			buf = malloc(RCTL_LOG_BUFSIZE, M_RCTL, M_NOWAIT);
-			if (buf == NULL) {
-				printf("rctl_enforce: out of memory\n");
-				continue;
-			}
-			sbuf_new(&sb, buf, RCTL_LOG_BUFSIZE, SBUF_FIXEDLEN);
-			sbuf_printf(&sb, "rule=");
-			rctl_rule_to_sbuf(&sb, rule);
-			sbuf_printf(&sb, " pid=%d ruid=%d jail=%s",
-			    p->p_pid, p->p_ucred->cr_ruid,
-			    p->p_ucred->cr_prison->pr_prison_racct->prr_name);
-			sbuf_finish(&sb);
-			devctl_notify("RCTL", "rule", "matched",
-			    sbuf_data(&sb));
-			sbuf_delete(&sb);
-			free(buf, M_RCTL);
+			rctl_devctl_handler(rule, p, NULL);
 			link->rrl_exceeded = 1;
 			continue;
 		case RCTL_ACTION_THROTTLE:
 			if (p->p_state != PRS_NORMAL)
 				continue;
 
-			if (rule->rr_amount == 0) {
-				racct_proc_throttle(p, rctl_throttle_max);
-				continue;
-			}
-
-			/*
-			 * Make the process sleep for a fraction of second
-			 * proportional to the ratio of process' resource
-			 * utilization compared to the limit.  The point is
-			 * to penalize resource hogs: processes that consume
-			 * more of the available resources sleep for longer.
-			 *
-			 * We're trying to defer division until the very end,
-			 * to minimize the rounding effects.  The following
-			 * calculation could have been written in a clearer
-			 * way like this:
-			 *
-			 * sleep_ms = hz * p->p_racct->r_resources[resource] /
-			 *     rule->rr_amount;
-			 * sleep_ms *= rctl_throttle_pct / 100;
-			 * if (sleep_ms < rctl_throttle_min)
-			 *         sleep_ms = rctl_throttle_min;
-			 *
-			 */
-			sleep_ms = xmul(hz, p->p_racct->r_resources[resource]);
-			sleep_ms = xmul(sleep_ms,  rctl_throttle_pct) / 100;
-			if (sleep_ms < rctl_throttle_min * rule->rr_amount)
-				sleep_ms = rctl_throttle_min * rule->rr_amount;
-
-			/*
-			 * Multiply that by the ratio of the resource
-			 * consumption for the container compared to the limit,
-			 * squared.  In other words, a process in a container
-			 * that is two times over the limit will be throttled
-			 * four times as much for hitting the same rule.  The
-			 * point is to penalize processes more if the container
-			 * itself (eg certain UID or jail) is above the limit.
-			 */
-			if (available < 0)
-				sleep_ratio = -available / rule->rr_amount;
-			else
-				sleep_ratio = 0;
-			sleep_ratio = xmul(sleep_ratio, sleep_ratio);
-			sleep_ratio = xmul(sleep_ratio, rctl_throttle_pct2) / 100;
-			sleep_ms = xadd(sleep_ms, xmul(sleep_ms, sleep_ratio));
-
-			/*
-			 * Finally the division.
-			 */
-			sleep_ms /= rule->rr_amount;
-
-			if (sleep_ms > rctl_throttle_max)
-				sleep_ms = rctl_throttle_max;
-#if 0
-			printf("%s: pid %d (%s), %jd of %jd, will sleep for %ju ms (ratio %ju, available %jd)\n",
-			   __func__, p->p_pid, p->p_comm,
-			   p->p_racct->r_resources[resource],
-			   rule->rr_amount, (uintmax_t)sleep_ms,
-			   (uintmax_t)sleep_ratio, (intmax_t)available);
-#endif
-
-			KASSERT(sleep_ms >= rctl_throttle_min, ("%s: %ju < %d\n",
-			    __func__, (uintmax_t)sleep_ms, rctl_throttle_min));
-			racct_proc_throttle(p, sleep_ms);
+			rctl_throttle_handler(rule, resource, p);
 			continue;
 		default:
 			if (link->rrl_exceeded != 0)
@@ -672,16 +855,7 @@ rctl_enforce(struct proc *p, int resource, uint64_t amount)
 			if (p->p_state != PRS_NORMAL)
 				continue;
 
-			KASSERT(rule->rr_action > 0 &&
-			    rule->rr_action <= RCTL_ACTION_SIGNAL_MAX,
-			    ("rctl_enforce: unknown action %d",
-			     rule->rr_action));
-
-			/*
-			 * We're using the fact that RCTL_ACTION_SIG* values
-			 * are equal to their counterparts from sys/signal.h.
-			 */
-			kern_psignal(p, rule->rr_action);
+			rctl_sig_handler(rule, p);
 			link->rrl_exceeded = 1;
 			continue;
 		}
