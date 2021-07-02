@@ -1,8 +1,9 @@
-atf_test_case racct_shm_count cleanup
-atf_test_case racct_shm_size cleanup
+. $(atf_get_srcdir)/utils.subr
 
+atf_test_case racct_shm_count cleanup
 racct_shm_count_head()
 {
+	atf_set "descr" "Tests nshm for a jail racct."
 	atf_set "require.user" "root"
 }
 racct_shm_count_body()
@@ -26,8 +27,10 @@ racct_shm_count_cleanup()
 	racct_cleanup
 }
 
+atf_test_case racct_shm_size cleanup
 racct_shm_size_head()
 {
+	atf_set "descr" "Tests shmsize for a jail racct."
 	atf_set "require.user" "root"
 }
 racct_shm_size_body()
@@ -72,69 +75,49 @@ racct_cleanup()
 
 racct_make_objects()
 {
+	local jailname max
 	jailname=$1
 	max=$2
-	i=1
-	while [ $i -le $max ]
-	do
-		jexec $jailname posixshmcontrol create "/$jailname$i"
-		if [ $? -ne 0 ]
-		then
-			atf_fail "Could not create /$jailname$i"
-		fi
-		i=$((${i}+1))
+	for i in $(seq 1 $max); do
+		atf_check -s exit:0 jexec "$jailname" posixshmcontrol create "/$jailname$i"
 	done
 }
 
 racct_make_forbidden_object()
 {
+	local jailname i
 	jailname=$1
 	i=$2
-	jexec $jailname posixshmcontrol create "/$jailname$i"
-	if [ $? -eq 0 ]
-	then
-		atf_fail "Created /$jailname$i"
-	fi
+	atf_check -s exit:1 -e ignore jexec "$jailname" posixshmcontrol create "/$jailname$i"
 }
 
 racct_truncate_objects()
 {
+	local jailname max size
 	jailname=$1
 	max=$2
 	size=$3
-	i=1
-	while [ $i -le $max ]
-	do
-		jexec $jailname posixshmcontrol truncate -s $size "/$jailname$i"
-		if [ $? -ne 0 ]
-		then
-			atf_fail "Could not truncate /$jailname$i to $size"
-		fi
-		i=$((${i}+1))
+	for i in $(seq 1 $max); do
+		atf_check -s exit:0 jexec "$jailname" posixshmcontrol truncate -s "$size" "/$jailname$i"
 	done
 }
 
 racct_truncate_forbidden_object()
 {
+	local jailname i size
 	jailname=$1
 	i=$2
 	size=$3
-	jexec $jailname posixshmcontrol truncate -s $size "/$jailname$i"
-	if [ $? -eq 0 ]
-	then
-		atf_fail "Truncated /$jailname$i to $size"
-	fi
+	atf_check -s exit:1 -e ignore jexec "$jailname" posixshmcontrol truncate -s "$size" "/$jailname$i"
 }
 
 racct_remove_objects()
 {
+	local jailname max
 	jailname=$1
 	max=$2
-	i=1
-	while [ $i -le $max ]
-	do
+	for i in $(seq 1 $max); do
 		jexec $jailname posixshmcontrol rm "/$jailname$i"
-		i=$((${i}+1))
 	done
 }
 

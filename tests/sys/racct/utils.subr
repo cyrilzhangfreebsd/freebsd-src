@@ -1,0 +1,17 @@
+racct_mkjail()
+{
+	jailname=$1
+	jail -c name=${jailname} persist
+	echo $jailname >> created_jails.lst
+}
+racct_cleanup()
+{
+	if [ -f created_jails.lst ]
+	then
+		for jailname in `cat created_jails.lst`
+		do
+			jail -r ${jailname}
+		done
+		rm created_jails.lst
+	fi
+}
