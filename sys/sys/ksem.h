@@ -37,11 +37,14 @@
 
 #include <sys/condvar.h>
 
+struct ucred;
+
 struct ksem {
 	int		ks_ref;		/* number of references */
 	mode_t		ks_mode;	/* protection bits */
 	uid_t		ks_uid;		/* creator uid */
 	gid_t		ks_gid;		/* creator gid */
+	struct ucred 	*ks_ucred;	/* createor ucred */
 	unsigned int	ks_value;	/* current value */
 	struct cv	ks_cv;		/* waiters sleep here */
 	int		ks_waiters;	/* number of waiters */

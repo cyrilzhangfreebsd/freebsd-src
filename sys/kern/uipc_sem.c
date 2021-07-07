@@ -119,7 +119,7 @@ SYSCTL_INT(_p1003_1b, OID_AUTO, nsems, CTLFLAG_RD, &nsems, 0,
 static int	kern_sem_wait(struct thread *td, semid_t id, int tryflag,
 		    struct timespec *abstime);
 static int	ksem_access(struct ksem *ks, struct ucred *ucred);
-static struct ksem *ksem_alloc(struct ucred *ucred, mode_t mode,
+static struct ksem *ksem_alloc(struct thread *td, mode_t mode,
 		    unsigned int value);
 static int	ksem_create(struct thread *td, const char *path,
 		    semid_t *semidp, mode_t mode, unsigned int value,
@@ -300,9 +300,21 @@ ksem_fill_kinfo(struct file *fp, struct kinfo_file *kif, struct filedesc *fdp)
  * routines.
  */
 static struct ksem *
-ksem_alloc(struct ucred *ucred, mode_t mode, unsigned int value)
+ksem_alloc(struct thread *td, mode_t mode, unsigned int value)
 {
 	struct ksem *ks;
+	struct ucred *ucred = td->td_ucred;
+
+#ifdef RACCT
+	if (racct_enable) {
+		PROC_LOCK(td->td_proc);
+		error = racct_add(td->td_proc, RACCT_NSEM, 1);
+		PROC_UNLOCK(td->td_proc);
+		if (error) {
+			return (NULL);
+		}
+	}
+#endif
 
 	mtx_lock(&ksem_count_lock);
 	if (nsems == p31b_getcfg(CTL_P1003_1B_SEM_NSEMS_MAX) || ksem_dead) {
@@ -314,6 +326,7 @@ ksem_alloc(struct ucred *ucred, mode_t mode, unsigned int value)
 	ks = malloc(sizeof(*ks), M_KSEM, M_WAITOK | M_ZERO);
 	ks->ks_uid = ucred->cr_uid;
 	ks->ks_gid = ucred->cr_gid;
+	ks->ks_ucred = ucred;
 	ks->ks_mode = mode;
 	ks->ks_value = value;
 	cv_init(&ks->ks_cv, "ksem");
@@ -346,6 +359,7 @@ ksem_drop(struct ksem *ks)
 #endif
 		cv_destroy(&ks->ks_cv);
 		free(ks, M_KSEM);
+		racct_sub_cred(ks->ks_ucred, RACCT_NSEM, 1);
 		mtx_lock(&ksem_count_lock);
 		nsems--;
 		mtx_unlock(&ksem_count_lock);
@@ -504,7 +518,7 @@ ksem_create(struct thread *td, const char *name, semid_t *semidp, mode_t mode,
 
 	if (name == NULL) {
 		/* Create an anonymous semaphore. */
-		ks = ksem_alloc(td->td_ucred, mode, value);
+		ks = ksem_alloc(td, mode, value);
 		if (ks == NULL)
 			error = ENOSPC;
 		else
@@ -536,7 +550,7 @@ ksem_create(struct thread *td, const char *name, semid_t *semidp, mode_t mode,
 		if (ks == NULL) {
 			/* Object does not exist, create it if requested. */
 			if (flags & O_CREAT) {
-				ks = ksem_alloc(td->td_ucred, mode, value);
+				ks = ksem_alloc(td, mode, value);
 				if (ks == NULL)
 					error = ENFILE;
 				else {
