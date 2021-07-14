@@ -40,6 +40,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/malloc.h>
+#include <sys/mount.h>
 #include <sys/conf.h>
 #include <sys/sysctl.h>
 #include <sys/libkern.h>
@@ -91,6 +92,7 @@ static SLIST_HEAD(, vmmdev_softc) head;
 
 static unsigned pr_allow_flag;
 static struct mtx vmmdev_mtx;
+static unsigned vmmdev_prison_slot;
 
 static MALLOC_DEFINE(M_VMMDEV, "vmmdev", "vmmdev");
 
@@ -99,6 +101,7 @@ SYSCTL_DECL(_hw_vmm);
 static int vmm_priv_check(struct ucred *ucred);
 static int devmem_create_cdev(const char *vmname, int id, char *devmem);
 static void devmem_destroy(void *arg);
+static int vmm_destroy(struct vmmdev_softc *sc);
 
 static int
 vmm_priv_check(struct ucred *ucred)
@@ -174,9 +177,7 @@ vmmdev_lookup(const char *name)
 {
 	struct vmmdev_softc *sc;
 
-#ifdef notyet	/* XXX kernel is not compiled with invariants */
 	mtx_assert(&vmmdev_mtx, MA_OWNED);
-#endif
 
 	SLIST_FOREACH(sc, &head, link) {
 		if (strcmp(name, vm_name(sc->vm)) == 0)
@@ -999,31 +1000,15 @@ vmmdev_destroy(void *arg)
 }
 
 static int
-sysctl_vmm_destroy(SYSCTL_HANDLER_ARGS)
+vmm_destroy(struct vmmdev_softc *sc)
 {
 	struct devmem_softc *dsc;
-	struct vmmdev_softc *sc;
 	struct cdev *cdev;
-	char *buf;
-	int error, buflen;
 
-	error = vmm_priv_check(req->td->td_ucred);
-	if (error)
-		return (error);
+	mtx_assert(&vmmdev_mtx, MA_OWNED);
 
-	buflen = VM_MAX_NAMELEN + 1;
-	buf = malloc(buflen, M_VMMDEV, M_WAITOK | M_ZERO);
-	strlcpy(buf, "beavis", buflen);
-	error = sysctl_handle_string(oidp, buf, buflen, req);
-	if (error != 0 || req->newptr == NULL)
-		goto out;
-
-	mtx_lock(&vmmdev_mtx);
-	sc = vmmdev_lookup(buf);
 	if (sc == NULL || sc->cdev == NULL) {
-		mtx_unlock(&vmmdev_mtx);
-		error = EINVAL;
-		goto out;
+		return (EINVAL);
 	}
 
 	/*
@@ -1035,7 +1020,6 @@ sysctl_vmm_destroy(SYSCTL_HANDLER_ARGS)
 	 */
 	cdev = sc->cdev;
 	sc->cdev = NULL;		
-	mtx_unlock(&vmmdev_mtx);
 
 	/*
 	 * Schedule all cdevs to be destroyed:
@@ -1053,8 +1037,35 @@ sysctl_vmm_destroy(SYSCTL_HANDLER_ARGS)
 		destroy_dev_sched_cb(dsc->cdev, devmem_destroy, dsc);
 	}
 	destroy_dev_sched_cb(cdev, vmmdev_destroy, sc);
-	error = 0;
 
+	return (0);
+}
+
+static int
+sysctl_vmm_destroy(SYSCTL_HANDLER_ARGS)
+{
+	struct vmmdev_softc *sc;
+	char *buf;
+	int error;
+	size_t buflen;
+
+	error = vmm_priv_check(req->td->td_ucred);
+	if (error)
+		return (error);
+
+	buflen = VM_MAX_NAMELEN + 1;
+	buf = malloc(buflen, M_VMMDEV, M_WAITOK | M_ZERO);
+	strlcpy(buf, "beavis", buflen);
+	error = sysctl_handle_string(oidp, buf, buflen, req);
+	if (error != 0 || req->newptr == NULL)
+		goto out;
+
+	mtx_lock(&vmmdev_mtx);
+
+	sc = vmmdev_lookup(buf);
+	error = vmm_destroy(sc);
+
+	mtx_unlock(&vmmdev_mtx);
 out:
 	free(buf, M_VMMDEV);
 	return (error);
@@ -1080,7 +1091,8 @@ sysctl_vmm_create(SYSCTL_HANDLER_ARGS)
 	struct cdev *cdev;
 	struct vmmdev_softc *sc, *sc2;
 	char *buf;
-	int error, buflen;
+	int error;
+	size_t buflen;
 
 	error = vmm_priv_check(req->td->td_ucred);
 	if (error)
@@ -1149,12 +1161,56 @@ SYSCTL_PROC(_hw_vmm, OID_AUTO, create,
     NULL, 0, sysctl_vmm_create, "A",
     NULL);
 
+static void
+vmmdev_prison_cleanup(struct prison *pr)
+{
+	struct vmmdev_softc *sc;
+	struct vmmdev_softc *tsc;
+
+	mtx_lock(&vmmdev_mtx);
+
+	SLIST_FOREACH_SAFE(sc, &head, link, tsc) {
+		if (sc->ucred->cr_prison == pr)
+			vmm_destroy(sc);
+	}
+
+	mtx_unlock(&vmmdev_mtx);
+}
+
+static int
+vmmdev_prison_remove(void *obj, void *data __unused)
+{
+	struct prison *pr = obj;
+
+	vmmdev_prison_cleanup(pr);
+	return (0);
+}
+
+static int
+vmmdev_prison_set(void *obj, void *data)
+{
+	struct prison *pr = obj;
+	struct vfsoptlist *opts = data;
+
+	if (vfs_flagopt(opts, "allow.novmm", NULL, 0))
+		vmmdev_prison_cleanup(pr);
+
+	return (0);
+}
+
 void
 vmmdev_init(void)
 {
+	osd_method_t methods[PR_MAXMETHOD] = {
+		[PR_METHOD_SET] = vmmdev_prison_set,
+		[PR_METHOD_REMOVE] = vmmdev_prison_remove,
+	};
+
 	mtx_init(&vmmdev_mtx, "vmm device mutex", NULL, MTX_DEF);
 	pr_allow_flag = prison_add_allow(NULL, "vmm", NULL,
 	    "Allow use of vmm in a jail.");
+
+	vmmdev_prison_slot = osd_jail_register(NULL, methods);
 }
 
 int
@@ -1162,10 +1218,12 @@ vmmdev_cleanup(void)
 {
 	int error;
 
-	if (SLIST_EMPTY(&head))
+	if (SLIST_EMPTY(&head)) {
+		osd_jail_deregister(vmmdev_prison_slot);
 		error = 0;
-	else
+	} else {
 		error = EBUSY;
+	}
 
 	return (error);
 }
