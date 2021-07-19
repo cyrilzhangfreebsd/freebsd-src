@@ -4,7 +4,7 @@ TESTSDIR=	${TESTSBASE}/sys/vmm
 
 BINDIR=		${TESTSDIR}
 
-ATF_TESTS_SH+=	vmm_cred_jail
+ATF_TESTS_SH+=	vmm_jail
 
 ${PACKAGE}FILES+=	utils.subr
 

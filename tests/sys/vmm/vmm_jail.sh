@@ -73,8 +73,54 @@ vmm_cred_jail_other_cleanup()
 	vmm_cleanup
 }
 
+atf_test_case vmm_remove_jail cleanup
+vmm_remove_jail_head()
+{
+	atf_set "descr" "Tests deleting a jail that has VM objects"
+	atf_set "require.user" "root"
+}
+vmm_remove_jail_body()
+{
+	if ! kldstat -qn vmm; then
+		atf_skip "vmm is not loaded"
+	fi
+	jail -c name=myjail allow.vmm persist
+	jexec myjail bhyvectl --vm=testvm --create
+	jail -r myjail
+	atf_check -s exit:1 -e ignore ls /dev/vmm
+}
+vmm_remove_jail_cleanup()
+{
+	bhyvectl --vm=testvm --destroy
+	vmm_cleanup
+}
+
+atf_test_case vmm_unenable_jail cleanup
+vmm_unenable_jail_head()
+{
+	atf_set "descr" "Tests allow.vmm=false on a jail that has VM objects"
+	atf_set "require.user" "root"
+}
+vmm_unenable_jail_body()
+{
+	if ! kldstat -qn vmm; then
+		atf_skip "vmm is not loaded"
+	fi
+	vmm_mkjail myjail
+	jexec myjail bhyvectl --vm=testvm --create
+	jail -m name=myjail allow.vmm=false
+	atf_check -s exit:1 -e ignore ls /dev/vmm
+}
+vmm_unenable_jail_cleanup()
+{
+	bhyvectl --vm=testvm --destroy
+	vmm_cleanup
+}
+
 atf_init_test_cases()
 {
 	atf_add_test_case vmm_cred_jail_host
 	atf_add_test_case vmm_cred_jail_other 
+	atf_add_test_case vmm_remove_jail
+	atf_add_test_case vmm_unenable_jail 
 }
