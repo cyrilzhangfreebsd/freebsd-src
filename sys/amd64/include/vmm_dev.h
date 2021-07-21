@@ -347,6 +347,23 @@ enum {
 	IOCNUM_RESTORE_TIME = 115
 };
 
+struct vmmctl_create_op {
+	char		name[VM_MAX_NAMELEN + 1];
+	int		flags;
+	uint64_t	reserved[16];
+};
+#define VMMCTL_CREATE_PERSISTENT	0x01
+
+struct vmmctl_destroy_op {
+	char		name[VM_MAX_NAMELEN + 1];
+	uint64_t	reserved[16];
+};
+
+#define VMMCTL_CREATE	\
+	_IOWR('v', 101, struct vmmctl_create_op)
+#define VMMCTL_DESTROY	\
+	_IOWR('v', 102, struct vmmctl_destroy_op)
+
 #define	VM_RUN		\
 	_IOWR('v', IOCNUM_RUN, struct vm_run)
 #define	VM_SUSPEND	\

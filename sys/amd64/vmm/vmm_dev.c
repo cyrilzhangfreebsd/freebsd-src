@@ -79,12 +79,14 @@ struct devmem_softc {
 };
 
 struct vmmdev_softc {
-	struct vm	*vm;		/* vm instance cookie */
+	struct vm	*vm;			/* vm instance cookie */
 	struct cdev	*cdev;
 	struct ucred	*ucred;
 	SLIST_ENTRY(vmmdev_softc) link;
 	SLIST_HEAD(, devmem_softc) devmem;
 	int		flags;
+	TAILQ_ENTRY(vmmdev_softc) fvmm_next;	/* next entry in fvmm list */
+	bool		persistent;
 };
 #define	VSC_LINKED		0x01
 
@@ -1063,6 +1065,11 @@ sysctl_vmm_destroy(SYSCTL_HANDLER_ARGS)
 	mtx_lock(&vmmdev_mtx);
 
 	sc = vmmdev_lookup(buf);
+	if (!sc->persistent) {
+		mtx_unlock(&vmmdev_mtx);
+		error = EPERM;
+		goto out;
+	}
 	error = vmm_destroy(sc);
 
 	mtx_unlock(&vmmdev_mtx);
@@ -1085,11 +1092,63 @@ static struct cdevsw vmmdevsw = {
 };
 
 static int
+vmm_create(const char *name, bool persistent, struct vmmdev_softc **sc)
+{
+	struct cdev *cdev;
+	struct vm *vm;
+	struct vmmdev_softc *tsc;
+	int error;
+
+	error = vm_create(name, &vm);
+	if (error != 0)
+		return (error);
+
+	tsc = malloc(sizeof(struct vmmdev_softc), M_VMMDEV, M_WAITOK | M_ZERO);
+	tsc->ucred = crhold(curthread->td_ucred);
+	tsc->vm = vm;
+	tsc->persistent = persistent;
+	SLIST_INIT(&tsc->devmem);
+
+	error = make_dev_p(MAKEDEV_CHECKNAME, &cdev, &vmmdevsw, tsc->ucred,
+	    UID_ROOT, GID_WHEEL, 0600, "vmm/%s", name);
+	if (error != 0) {
+		vmmdev_destroy(tsc);
+		return (error);
+	}
+
+	tsc->cdev = cdev;
+	tsc->cdev->si_drv1 = tsc;
+	*sc = tsc;
+
+	return (0);
+}
+
+static int
+vmm_add(struct vmmdev_softc *sc)
+{
+	struct vmmdev_softc *tsc;
+
+	mtx_assert(&vmmdev_mtx, MA_OWNED);
+
+	/*
+	 * Lookup the name just in case somebody sneaked in.
+	 */
+	tsc = vmmdev_lookup(vm_name(sc->vm));
+	if (tsc == NULL) {
+		SLIST_INSERT_HEAD(&head, sc, link);
+		sc->flags |= VSC_LINKED;
+	}
+
+	if (tsc != NULL)
+		return (EEXIST);
+
+	return (0);
+}
+
+static int
 sysctl_vmm_create(SYSCTL_HANDLER_ARGS)
 {
-	struct vm *vm;
-	struct cdev *cdev;
-	struct vmmdev_softc *sc, *sc2;
+	struct vmmdev_softc *sc;
 	char *buf;
 	int error;
 	size_t buflen;
@@ -1105,52 +1164,21 @@ sysctl_vmm_create(SYSCTL_HANDLER_ARGS)
 	if (error != 0 || req->newptr == NULL)
 		goto out;
 
-	mtx_lock(&vmmdev_mtx);
 	sc = vmmdev_lookup(buf);
-	mtx_unlock(&vmmdev_mtx);
 	if (sc != NULL) {
 		error = EEXIST;
 		goto out;
 	}
 
-	error = vm_create(buf, &vm);
+	error = vmm_create(buf, true, &sc);
 	if (error != 0)
 		goto out;
 
-	sc = malloc(sizeof(struct vmmdev_softc), M_VMMDEV, M_WAITOK | M_ZERO);
-	sc->ucred = crhold(curthread->td_ucred);
-	sc->vm = vm;
-	SLIST_INIT(&sc->devmem);
-
-	/*
-	 * Lookup the name again just in case somebody sneaked in when we
-	 * dropped the lock.
-	 */
 	mtx_lock(&vmmdev_mtx);
-	sc2 = vmmdev_lookup(buf);
-	if (sc2 == NULL) {
-		SLIST_INSERT_HEAD(&head, sc, link);
-		sc->flags |= VSC_LINKED;
-	}
+	error = vmm_add(sc);
 	mtx_unlock(&vmmdev_mtx);
-
-	if (sc2 != NULL) {
-		vmmdev_destroy(sc);
-		error = EEXIST;
-		goto out;
-	}
-
-	error = make_dev_p(MAKEDEV_CHECKNAME, &cdev, &vmmdevsw, sc->ucred,
-	    UID_ROOT, GID_WHEEL, 0600, "vmm/%s", buf);
-	if (error != 0) {
-		vmmdev_destroy(sc);
-		goto out;
-	}
-
-	mtx_lock(&vmmdev_mtx);
-	sc->cdev = cdev;
-	sc->cdev->si_drv1 = sc;
-	mtx_unlock(&vmmdev_mtx);
+	if (error != 0)
+		vmm_destroy(sc);
 
 out:
 	free(buf, M_VMMDEV);
@@ -1160,73 +1188,6 @@ SYSCTL_PROC(_hw_vmm, OID_AUTO, create,
     CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_PRISON | CTLFLAG_MPSAFE,
     NULL, 0, sysctl_vmm_create, "A",
     NULL);
-
-static void
-vmmdev_prison_cleanup(struct prison *pr)
-{
-	struct vmmdev_softc *sc;
-	struct vmmdev_softc *tsc;
-
-	mtx_lock(&vmmdev_mtx);
-
-	SLIST_FOREACH_SAFE(sc, &head, link, tsc) {
-		if (sc->ucred->cr_prison == pr)
-			vmm_destroy(sc);
-	}
-
-	mtx_unlock(&vmmdev_mtx);
-}
-
-static int
-vmmdev_prison_remove(void *obj, void *data __unused)
-{
-	struct prison *pr = obj;
-
-	vmmdev_prison_cleanup(pr);
-	return (0);
-}
-
-static int
-vmmdev_prison_set(void *obj, void *data)
-{
-	struct prison *pr = obj;
-	struct vfsoptlist *opts = data;
-
-	if (vfs_flagopt(opts, "allow.novmm", NULL, 0))
-		vmmdev_prison_cleanup(pr);
-
-	return (0);
-}
-
-void
-vmmdev_init(void)
-{
-	osd_method_t methods[PR_MAXMETHOD] = {
-		[PR_METHOD_SET] = vmmdev_prison_set,
-		[PR_METHOD_REMOVE] = vmmdev_prison_remove,
-	};
-
-	mtx_init(&vmmdev_mtx, "vmm device mutex", NULL, MTX_DEF);
-	pr_allow_flag = prison_add_allow(NULL, "vmm", NULL,
-	    "Allow use of vmm in a jail.");
-
-	vmmdev_prison_slot = osd_jail_register(NULL, methods);
-}
-
-int
-vmmdev_cleanup(void)
-{
-	int error;
-
-	if (SLIST_EMPTY(&head)) {
-		osd_jail_deregister(vmmdev_prison_slot);
-		error = 0;
-	} else {
-		error = EBUSY;
-	}
-
-	return (error);
-}
 
 static int
 devmem_mmap_single(struct cdev *cdev, vm_ooffset_t *offset, vm_size_t len,
@@ -1321,4 +1282,185 @@ devmem_destroy(void *arg)
 	KASSERT(dsc->cdev, ("%s: devmem cdev already destroyed", __func__));
 	dsc->cdev = NULL;
 	dsc->sc = NULL;
+}
+
+struct fvmm {
+	TAILQ_HEAD(softc_list, vmmdev_softc) scs;
+};
+
+static int
+fvmm_destroy(struct fvmm *fvmm, const char *name)
+{
+	struct vmmdev_softc *sc, *tsc;
+	int error = ENOENT;
+
+	mtx_lock(&vmmdev_mtx);
+	TAILQ_FOREACH_SAFE(sc, &fvmm->scs, fvmm_next, tsc) {
+		if (strcmp(vm_name(sc->vm), name) == 0) {
+			vmm_destroy(sc);
+			TAILQ_REMOVE(&fvmm->scs, sc, fvmm_next);
+			error = 0;
+		}
+	}
+	mtx_unlock(&vmmdev_mtx);
+
+	return (error);
+}
+
+static void
+fvmm_dtor(void *data)
+{
+	struct fvmm *fvmm = data;
+	struct vmmdev_softc *sc;
+
+	mtx_lock(&vmmdev_mtx);
+	while ((sc = TAILQ_FIRST(&fvmm->scs))) {
+		TAILQ_REMOVE(&fvmm->scs, sc, fvmm_next);
+		if (!sc->persistent)
+			vmm_destroy(sc);
+	}
+	mtx_unlock(&vmmdev_mtx);
+	free(fvmm, M_VMMDEV);
+}
+
+static int
+vmmctl_open(struct cdev *dev, int oflags, int devtype, struct thread *td)
+{
+	struct fvmm *fvmm;
+	int error;
+
+	fvmm = malloc(sizeof(struct fvmm), M_VMMDEV, M_WAITOK | M_ZERO);
+	TAILQ_INIT(&fvmm->scs);
+	error = devfs_set_cdevpriv(fvmm, fvmm_dtor);
+	if (error)
+		fvmm_dtor(fvmm);
+	return (error);
+}
+
+static int
+vmmctl_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int flag,
+    struct thread *td)
+{
+	struct fvmm *fvmm;
+	struct vmmdev_softc *sc;
+	struct vmmctl_create_op *create_op;
+	struct vmmctl_destroy_op *destroy_op;
+	bool persistent;
+	int error = 0;
+
+	devfs_get_cdevpriv((void **)&fvmm);
+
+	switch (cmd) {
+	case VMMCTL_CREATE:
+		create_op = (struct vmmctl_create_op *)data;
+		if (strnlen(create_op->name, VM_MAX_NAMELEN + 1) ==
+		    VM_MAX_NAMELEN + 1) {
+			error = EINVAL;
+			break;
+		}
+		persistent = create_op->flags & VMMCTL_CREATE_PERSISTENT;
+		error = vmm_create(create_op->name, persistent, &sc);
+		if (error)
+			break;
+		mtx_lock(&vmmdev_mtx);
+		error = vmm_add(sc);
+		if (error) {
+			vmm_destroy(sc);
+			mtx_unlock(&vmmdev_mtx);
+			break;
+		}
+		TAILQ_INSERT_HEAD(&fvmm->scs, sc, fvmm_next);
+		mtx_unlock(&vmmdev_mtx);
+		break;
+	case VMMCTL_DESTROY:
+		destroy_op = (struct vmmctl_destroy_op *)data;
+		if (strnlen(destroy_op->name, VM_MAX_NAMELEN + 1) ==
+		    VM_MAX_NAMELEN + 1) {
+			error = EINVAL;
+			break;
+		}
+		error = fvmm_destroy(fvmm, destroy_op->name);
+		break;
+	}
+
+	return (error);
+}
+
+static void
+vmmdev_prison_cleanup(struct prison *pr)
+{
+	struct vmmdev_softc *sc;
+	struct vmmdev_softc *tsc;
+
+	mtx_lock(&vmmdev_mtx);
+
+	SLIST_FOREACH_SAFE(sc, &head, link, tsc) {
+		if (sc->ucred->cr_prison == pr)
+			vmm_destroy(sc);
+	}
+
+	mtx_unlock(&vmmdev_mtx);
+}
+
+static int
+vmmdev_prison_remove(void *obj, void *data __unused)
+{
+	struct prison *pr = obj;
+
+	vmmdev_prison_cleanup(pr);
+	return (0);
+}
+
+static int
+vmmdev_prison_set(void *obj, void *data)
+{
+	struct prison *pr = obj;
+	struct vfsoptlist *opts = data;
+
+	if (vfs_flagopt(opts, "allow.novmm", NULL, 0))
+		vmmdev_prison_cleanup(pr);
+
+	return (0);
+}
+
+static struct cdevsw vmmctl_cdevsw = {
+        .d_version =    D_VERSION,
+        .d_open =       vmmctl_open,
+        .d_ioctl =      vmmctl_ioctl,
+        .d_name =       "vmmctl",
+};
+static struct cdev *vmmctl_dev;
+
+void
+vmmdev_init(void)
+{
+	osd_method_t methods[PR_MAXMETHOD] = {
+		[PR_METHOD_SET] = vmmdev_prison_set,
+		[PR_METHOD_REMOVE] = vmmdev_prison_remove,
+	};
+
+	mtx_init(&vmmdev_mtx, "vmm device mutex", NULL, MTX_DEF);
+	pr_allow_flag = prison_add_allow(NULL, "vmm", NULL,
+	    "Allow use of vmm in a jail.");
+
+	vmmdev_prison_slot = osd_jail_register(NULL, methods);
+
+	vmmctl_dev = make_dev(&vmmctl_cdevsw, 0,
+	    UID_ROOT, GID_WHEEL, 0600, "vmmctl");
+}
+
+int
+vmmdev_cleanup(void)
+{
+	int error;
+
+	if (SLIST_EMPTY(&head)) {
+		osd_jail_deregister(vmmdev_prison_slot);
+		destroy_dev(vmmctl_dev);
+		error = 0;
+	} else {
+		error = EBUSY;
+	}
+
+	return (error);
 }
