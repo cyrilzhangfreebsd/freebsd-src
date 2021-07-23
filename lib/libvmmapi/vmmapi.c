@@ -106,6 +106,44 @@ vm_device_open(const char *name)
 }
 
 int
+vmmctl_open(void)
+{
+	/* Try to load vmm(4) */
+	if (modfind("vmm") < 0)
+		kldload("vmm");
+
+	return (open("/dev/vmmctl", O_RDWR, 0));
+}
+
+int
+vm_fcreate(int fd, const char *name)
+{
+	struct vmmctl_op op;
+
+	if (strlen(name) >= VM_MAX_NAMELEN) {
+		errno = ENAMETOOLONG;
+		return (-1);
+	}
+
+	strcpy(op.name, name);
+	return (ioctl(fd, VMMCTL_CREATE, &op));
+}
+
+int
+vm_fdestroy(int fd, const char *name)
+{
+	struct vmmctl_op op;
+
+	if (strlen(name) >= VM_MAX_NAMELEN) {
+		errno = ENAMETOOLONG;
+		return (-1);
+	}
+
+	strcpy(op.name, name);
+	return (ioctl(fd, VMMCTL_DESTROY, &op));
+}
+
+int
 vm_create(const char *name)
 {
 	/* Try to load vmm(4) module before creating a guest. */

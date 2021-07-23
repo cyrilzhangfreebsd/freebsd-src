@@ -33,6 +33,7 @@
 
 #include <sys/param.h>
 #include <sys/cpuset.h>
+#include <machine/vmm.h>
 #include <machine/vmm_dev.h>
 
 #include <stdbool.h>
@@ -112,6 +113,10 @@ int	vm_mmap_memseg(struct vmctx *ctx, vm_paddr_t gpa, int segid,
 	    vm_ooffset_t segoff, size_t len, int prot);
 
 int	vm_munmap_memseg(struct vmctx *ctx, vm_paddr_t gpa, size_t len);
+
+int	vmmctl_open(void);
+int	vm_fcreate(int fd, const char *name);
+int	vm_fdestroy(int fd, const char *name);
 
 int	vm_create(const char *name);
 int	vm_get_device_fd(struct vmctx *ctx);
