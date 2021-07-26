@@ -718,6 +718,7 @@ main(int argc, char** argv)
 	void (*func)(struct loader_callbacks *, void *, int, int);
 	uint64_t mem_size;
 	int opt, error, memflags;
+	int vmmctl_fd;
 
 	progname = basename(argv[0]);
 
@@ -783,7 +784,17 @@ main(int argc, char** argv)
 	vmname = argv[0];
 
 	need_reinit = 0;
-	error = vm_create(vmname);
+	fd = vmmctl_open();
+	if (fd == -1) {
+		if (errno == ENOENT) {
+			error = vm_create(vmname);
+		} else {
+			perror("vmmctl_open");
+			exit(1);
+		}
+	} else {
+		error = vm_fcreate(fd, vmname, true);
+	}
 	if (error) {
 		if (errno != EEXIST) {
 			perror("vm_create");

@@ -1062,7 +1062,7 @@ static struct vmctx *
 do_open(const char *vmname)
 {
 	struct vmctx *ctx;
-	int error;
+	int fd, error;
 	bool reinit, romboot;
 #ifndef WITHOUT_CAPSICUM
 	cap_rights_t rights;
@@ -1075,29 +1075,26 @@ do_open(const char *vmname)
 	if (lpc_bootrom())
 		romboot = true;
 
-	error = vm_create(vmname);
-	if (error) {
-		if (errno == EEXIST) {
-			if (romboot) {
-				reinit = true;
+	/* In the non-romboot case, the vm should already be created. */
+	if (romboot) {
+		fd = vmmctl_open();
+		if (fd == -1) {
+			if (errno == ENOENT) {
+				error = vm_create(vmname);
 			} else {
-				/*
-				 * The virtual machine has been setup by the
-				 * userspace bootloader.
-				 */
+				perror("vmmctl_open");
+				exit(4);
 			}
 		} else {
-			perror("vm_create");
-			exit(4);
+			error = vm_fcreate(fd, vmname, false);
 		}
-	} else {
-		if (!romboot) {
-			/*
-			 * If the virtual machine was just created then a
-			 * bootrom must be configured to boot it.
-			 */
-			fprintf(stderr, "virtual machine cannot be booted\n");
-			exit(4);
+		if (error) {
+			if (errno == EEXIST) {
+				reinit = true;
+			} else {
+				perror("vm_create");
+				exit(4);
+			}
 		}
 	}
 
