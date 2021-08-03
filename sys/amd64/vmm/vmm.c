@@ -43,6 +43,8 @@ __FBSDID("$FreeBSD$");
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/proc.h>
+#include <sys/racct.h>
+#include <sys/resourcevar.h>
 #include <sys/rwlock.h>
 #include <sys/sched.h>
 #include <sys/smp.h>
@@ -737,6 +739,9 @@ vm_mmap_memseg(struct vm *vm, vm_paddr_t gpa, int segid, vm_ooffset_t first,
 {
 	struct mem_seg *seg;
 	struct mem_map *m, *map;
+	vm_map_t vm_map;
+	vm_size_t npages;
+	unsigned long nsize;
 	vm_ooffset_t last;
 	int i, error;
 
@@ -772,7 +777,9 @@ vm_mmap_memseg(struct vm *vm, vm_paddr_t gpa, int segid, vm_ooffset_t first,
 	if (map == NULL)
 		return (ENOSPC);
 
-	error = vm_map_find(&vm->vmspace->vm_map, seg->object, first, &gpa,
+	vm_map = &vm->vmspace->vm_map;
+
+	error = vm_map_find(vm_map, seg->object, first, &gpa,
 	    len, 0, VMFS_NO_SPACE, prot, prot, 0);
 	if (error != KERN_SUCCESS)
 		return (EFAULT);
@@ -780,10 +787,35 @@ vm_mmap_memseg(struct vm *vm, vm_paddr_t gpa, int segid, vm_ooffset_t first,
 	vm_object_reference(seg->object);
 
 	if (flags & VM_MEMMAP_F_WIRED) {
-		error = vm_map_wire(&vm->vmspace->vm_map, gpa, gpa + len,
+		npages = atop(len);
+		nsize = ptoa(npages + pmap_wired_count(vm_map->pmap));
+		PROC_LOCK(curproc);
+		if (nsize > lim_cur_proc(curproc, RLIMIT_MEMLOCK)) {
+			PROC_UNLOCK(curproc);
+			return (ENOMEM);
+		}
+		PROC_UNLOCK(curproc);
+#ifdef RACCT
+		if (racct_enable) {
+			PROC_LOCK(curproc);
+			error = racct_set(curproc, RACCT_MEMLOCK, nsize);
+			PROC_UNLOCK(curproc);
+			if (error)
+				return (ENOMEM);
+		}
+#endif
+		error = vm_map_wire(vm_map, gpa, gpa + len,
 		    VM_MAP_WIRE_USER | VM_MAP_WIRE_NOHOLES);
 		if (error != KERN_SUCCESS) {
-			vm_map_remove(&vm->vmspace->vm_map, gpa, gpa + len);
+			vm_map_remove(vm_map, gpa, gpa + len);
+#ifdef RACCT
+			if (racct_enable) {
+				PROC_LOCK(curproc);
+				racct_set(curproc, RACCT_MEMLOCK,
+				    ptoa(pmap_wired_count(vm_map->pmap)));
+				PROC_UNLOCK(curproc);
+			}
+#endif
 			return (error == KERN_RESOURCE_SHORTAGE ? ENOMEM :
 			    EFAULT);
 		}
